@@ -1,0 +1,10 @@
+name: ltm
+channels:
+  - defaults
+dependencies:
+  - scipy
+  - matplotlib
+  - jupyter
+  - h5py
+  - pandas
+  - natsort

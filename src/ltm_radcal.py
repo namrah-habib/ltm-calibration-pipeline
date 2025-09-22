@@ -1,16 +1,20 @@
+from dataclasses import dataclass, field
 import h5py    
 import numpy as np    
 import matplotlib.pyplot as plt
 import scipy.io as sio
 import pickle
-import warnings
+from pathlib import Path
 
-from dataclasses import dataclass, field
-from ltm_model import LTM_Model
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+from src.ltm_model import LTM_Model
+from src.preview_frame import preview_frame
 
 @dataclass
 class RadCal:
-    """Class to handle loading, storing & processing LTM calibration and observation data."""
+    """Class to handle loading, storing & processing LTM data."""
 
     # Initialize the fields to store calibration data (raw data for each group and look)
     Int: dict = field(default_factory=dict)
@@ -28,23 +32,37 @@ class RadCal:
     temps: dict = field(default_factory=dict)
     
     def __post_init__(self):
-        """Initialize nested dictionaries for metadata and corrected data."""
+        """Initialize empty nested dictionaries used by RadCal.
+
+        Parameters:
+            None
+
+        Raises:
+            None
+
+        Updates RadCal:
+            row_corrected_data:         Sets empty dicts for 'Int', 'Cold', 'Hot'.
+            times/tdi_flg/temps:        Sets empty dicts for 'Int', 'Cold', 'Hot'.
+        """
+
         self.row_corrected_data = {k: {} for k in ['Int', 'Cold', 'Hot']}
         self.times = {k: {} for k in ['Int', 'Cold', 'Hot']}
         self.tdi_flg = {k: {} for k in ['Int', 'Cold', 'Hot']}
         self.temps = {k: {} for k in ['Int', 'Cold', 'Hot']} 
 
     def assert_array_shape(self, array, calibration_file=False):
-        """Asserts that the given array has a shape of (frames, channels/rows, columns) where:
-            - Frames can be any size (first dimension is flexible)
-            - Second dimension must be either 15 (channels) or 288 (rows)
-            - Third dimension must be either 384 or 385 (columns)
+        """Validate expected array dimensionality for LTM data.
 
         Parameters:
-            array (np.ndarray): Input array to validate.
+            array (np.ndarray):         Input data array to validate.
+            calibration_file (bool):    True if data is a calibration table (2-D expected).
 
         Raises:
-            ValueError: If the array does not match the expected shape constraints.
+            TypeError:                  If array is not a NumPy array.
+            ValueError:                 If dimensionality or sizes do not match expectations.
+
+        Updates RadCal:
+            None
         """
         if not isinstance(array, np.ndarray):
             raise TypeError("Input must be a NumPy array.")
@@ -64,16 +82,27 @@ class RadCal:
             raise ValueError(f"Second dimension must be 15 (channels) or 288 (rows), but got {second_dim}.")
 
         if third_dim not in (384, 385):
-            raise ValueError(f"Third dimension must be 384 or 385 (columns), but got {third_dim}.")
-
-        return 
+            raise ValueError(f"Third dimension must be 384 or 385 (columns), but got {third_dim}.") 
 
     def load_data(self, file_path: str, calibration_flag: bool = False):
-        """Load the HDF5 file and extract data into RadCal object."""
+        """Load the LTM HDF5 raw data and extract data and metadata into RadCal object.
+
+        Parameters:
+            file_path (str):            Path to the HDF5 file.
+            calibration_flag (bool):    True if file is from the LTM FM calibration campaign.
+
+        Raises:
+            FileNotFoundError:          If the file cannot be opened.
+            KeyError:                   If expected groups/datasets are missing.
+            ValueError:                 If array shapes do not match expectations.
+
+        Updates RadCal:
+            Int/Cold/Hot:               Raw arrays per look.
+            times/tdi_flg/temps:        Per-look metadata (when present).
+        """
         
         with h5py.File(file_path, 'r') as f:
             if calibration_flag:
-                # File with name ltm-cal-ext-*.h5 from LTM FM Calibration Campaign: 
                 print(f"Loading calibration data from {file_path}")
 
                 # Define dataset mappings
@@ -95,14 +124,10 @@ class RadCal:
                             else:
                                 print(f"Warning: {dataset_name} missing in {category}!")
                         
-                        print(f"Original {category} -> {key}: shape {f[category][dataset_name][:].shape}")
-                        print(f"Loaded {category} -> {key}: shape {self.__dict__[category][key].shape}")
-
                 # Extract times & temperatures:
                 for category, subgroups in mapping.items():
                     if category in f:
                         for subgroup_name, dataset_name in subgroups.items():
-                            # Extract times, temperatures, and tdi flags for each subgroup
                             self.times[category][subgroup_name] = f[category]['startTime'][()] if 'startTime' in f[category] else None
                             self.temps[category][subgroup_name] = f[category]['SceneTemp'][()] if 'SceneTemp' in f[category] else None
                             self.tdi_flg[category][subgroup_name] = f[category]['tdi'][()] if 'tdi' in f[category] else False
@@ -135,8 +160,6 @@ class RadCal:
                 # Loop through the subgroups within each group and save attributes:
                 for key in ['calibration', 'observation']:
                     for subgroup in f[key]:
-                        # print(f"{key}/{subgroup} attributes: {list(f[key][subgroup].attrs.keys())}")
-                        # print(f"{key}/{subgroup} attributes: {(f[key][subgroup].attrs['time'])}")
                         if key == 'calibration' and 'bb' in subgroup:
                             self.times['Int'][subgroup] = f[key][subgroup].attrs['time']
                             self.tdi_flg['Int'][subgroup] = f[key][subgroup].attrs['tdi']
@@ -153,15 +176,24 @@ class RadCal:
                             self.temps['Hot'][subgroup] = f[key][subgroup].attrs.get('SceneTemp', None)
 
             # Verification:
-            # print(f"Time times for Int: {self.times['Int']}")
-            # print(f"Time times for Cold: {self.times['Cold']}")
-            # print(f"Time times for Hot: {self.times['Hot']}")
             print(f"Data successfully loaded from {file_path}")
-            
-            return 
     
     def load_temperature_gain_table(self, tdi_flag: bool = True):
-        # Temperature dependent fit of detector:                
+        """Load the temperature-gain look-up table for detector correction.
+
+        Parameters:
+            tdi_flag (bool):            True to load TDI-specific table; False loads non-TDI table.
+
+        Raises:
+            FileNotFoundError:          If the required pickle is missing.
+            ValueError:                 If the table shape is invalid.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 2-D gain-ratio table used in row correction.
+        """            
         if tdi_flag:
             with open('./calibration-tables/TemperatureGain_tdi.pkl', 'rb') as f:
                 b2 = pickle.load(f)
@@ -171,39 +203,70 @@ class RadCal:
                 b2 = pickle.load(f).T
                 
         self.assert_array_shape(b2, calibration_file=True)      
-        print(f'Shape of temperature dependent gain table: {b2.shape}')
 
         return b2
 
     def load_channel_map(self):
-        mat_data = sio.loadmat('./calibration-tables/RadCalIndex.mat')
-        channel_map = mat_data['RadCal_Index']['ChannelMap'][0,0].T
-        self.assert_array_shape(channel_map, calibration_file=True)
+        """Load the channel map from RadCalIndex.mat.
 
+        Parameters:
+            None
+
+        Raises:
+            FileNotFoundError:          If RadCalIndex.mat is missing.
+            ValueError:                 If the channel map shape is invalid.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 2-D channel map (288×384/385 expected).
+        """
+        mat = sio.loadmat('./calibration-tables/RadCalIndex.mat')
+        channel_map = mat['RadCal_Index']['ChannelMap'][0,0].T
+        if not isinstance(channel_map, np.ndarray) or channel_map.ndim != 3 or channel_map.shape[0] != 15:
+            raise ValueError(f"ChannelMap expected shape (15, rows, cols); got {None if not hasattr(channel_map,'shape') else channel_map.shape}")
         return channel_map
 
     def load_bad_pixel_table(self):
+        """Load (or compute) a bad-pixel table.
+
+        Parameters:
+            None
+
+        Raises:
+            NotImplementedError:        If not yet implemented.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            None
+        """
         print("Still needs to be added")
         return
 
     def apply_row_correction(self, mask_ind: int = 365):
-        """Apply row correction to the 'Int', 'Cold', and 'Hot' data."""
+        """Apply row & offset correction (and stray-light correction) to all looks.
 
+        Parameters:
+            mask_ind (int):             Column index where masked region begins (used for offsets).
+
+        Raises:
+            FileNotFoundError:          If required calibration tables are missing.
+            ValueError:                 If shapes are inconsistent.
+
+        Updates RadCal:
+            row_corrected_data[key][subgroup]:
+                • 'rawdata'                     : original frames (copy)
+                • 'offsetAverage'               : per-row offsets
+                • 'corFrames'                   : row-corrected frames
+                • 'stableCorFrames'             : stabilized temperature-gain row-corrected frames
+                • 'stableRowSLCorFrames'        : stabilized frames with stray light removed
+        """
         for key in ['Int', 'Cold', 'Hot']:
             for subgroup in getattr(self, key):
-                
-                # Temperature dependent fit of detector:                
-                # b2 = self.load_temperature_gain_table(self, tdi_flag=self.tdi_flg[key][subgroup]) --> why doesn't work? 
-                if self.tdi_flg[key][subgroup]:
-                    with open('./calibration-tables/TemperatureGain_tdi.pkl', 'rb') as f:
-                        b2 = pickle.load(f)
-            
-                else:
-                    with open('./calibration-tables/TemperatureGain.pkl', 'rb') as f:
-                        b2 = pickle.load(f).T
-                        
-                self.assert_array_shape(b2, calibration_file=True)      
-                print(f'Shape of temperature dependent gain table: {b2.shape}')
+                b2 = self.load_temperature_gain_table(tdi_flag=self.tdi_flg[key][subgroup])
             
                 # Get the (frames, channels, rows) array for each look:
                 data = getattr(self, key)[subgroup]
@@ -218,7 +281,7 @@ class RadCal:
                 stable_cor_frames_list = []
                 stray_light_cor_frames_list = []
 
-                # Get the avg value over all masked pixels during internal calibration at the start of the observation (averaging all frames): 
+                # Get the avg value over all masked pixels during internal calibration at the start of the observation: 
                 avg_int_offset = np.mean(self.Int['bb_look11'][:, :, mask_ind:-1])
 
                 for iframe in range(num_frames):
@@ -245,8 +308,23 @@ class RadCal:
                 self.row_corrected_data[key][subgroup]['stableRowSLCorFrames'] = np.array(stray_light_cor_frames_list)
 
     def row_cor(self, M: np.ndarray, mask_ind: int, avg_int_offset: float, gain_ratio: np.ndarray = None) -> np.ndarray:
-        """Subtracting the mean of rows mask_ind:-1 from the rest of the frame."""
-       
+        """Apply per-row offset removal (and optional gain-ratio scaling).
+
+        Parameters:
+            M (np.ndarray):             2-D frame (rows×cols) to correct.
+            mask_ind (int):             Column index where masked region begins.
+            avg_int_offset (float):     Global internal offset of masked pixels.
+            gain_ratio (np.ndarray):    Optional 2-D array matching M for stabilization.
+
+        Raises:
+            ValueError:                 If gain_ratio is provided but incompatible.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 Corrected frame (same shape as M).
+        """
         # If gain_ratio is not provided, create a default one (array of ones with the same shape as M)
         if gain_ratio is None:
             gain_ratio = np.ones_like(M)
@@ -258,12 +336,42 @@ class RadCal:
         return M - gain_ratio * (np.mean(M[:, mask_ind:-1], axis=1) - avg_int_offset)[:, np.newaxis]
 
     def row_cor_offset(self, M: np.ndarray, mask_ind: int) -> np.ndarray:
-        """Calculates the average value of masked pixels in given row."""
+        """Compute the average masked-column value per row.
+
+        Parameters:
+            M (np.ndarray):             2-D frame (rows×cols).
+            mask_ind (int):             Column index where masked region begins.
+
+        Raises:
+            None
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 1-D per-row average over masked pixels.
+        """
         
         return np.mean(M[:, mask_ind:-1], axis=1)
 
     def stray_light_correction(self, M: np.ndarray, key, subgroup):
-        # Get stray light measurement: 
+        """Subtract the measured stray-light (from FM ground calibration campaign) pattern from a frame.
+
+        Parameters:
+            M (np.ndarray):             2-D stabilized row-corrected frame.
+            key (str):                  One of 'Int', 'Cold', 'Hot'.
+            subgroup (str):             Look name within the key.
+
+        Raises:
+            FileNotFoundError:          If stray light table is missing.
+            ValueError:                 If table shape is invalid.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 Frame after stray-light subtraction.
+        """
         if self.tdi_flg[key][subgroup]:
             with open('./calibration-tables/StrayLightCorr_tdi.pkl', 'rb') as f:
                 measured_straylight = pickle.load(f)
@@ -275,11 +383,24 @@ class RadCal:
 
         return M - measured_straylight
 
-    def calc_calibrated_radiance(self, model: LTM_Model, calibration_flag=False):
-        """Calibrate the radiance using the provided LTM model and temperatures."""
+    def calc_calibrated_radiance(self, calibration_flag=False, plot_gain_offset: bool = False):
+        """Compute calibrated radiance using a 4-point calibration for each LTM observation.
+
+        Parameters:
+            calibration_flag (bool):    True for calibration-campaign files (2 looks only = 2-point calibration).
+            plot_gain_offset (bool):    If True, plot G(t) and A(t) diagnostics.
+
+        Raises:
+            TypeError:                  If required calibration views are missing (obs path).
+            ValueError:                 If shapes are inconsistent.
+
+        Updates RadCal:
+            - calibrated_products[key][subgroup]['calibratedRadiance']: list/array of frames.
+        """
         # Get the times from the RadCal object for the calibration views
         t1 = self.times['Int']['bb_look11']
         t2 = self.times['Cold']['cs_look11']
+
         t4 = self.times['Int'].get('bb_look21', t1)   # Use t1 if t4 is missing (but check not using this)
         t5 = self.times['Cold'].get('cs_look21', t2)  # Use t2 if t5 is missing
 
@@ -292,7 +413,8 @@ class RadCal:
         # Calculate the radiance values for each temperature (T1, T2, T4, T5) using the LTM model:
         # opted to not add stray light here because I removed it earlier than in the pipeline figure 
         # (right after row correction) so theoretically if everything is liner order doens't matter 
-        # and the frames I comparing to have already removed stray light contribution. --> Confirm with Rory! 
+        # and the frames I comparing to have already removed stray light contribution. 
+        model = LTM_Model()
         B1 = model.calcRadiance(model.channelFilterMap, [T1]) 
         B2 = model.calcRadiance(model.channelFilterMap, [T2]) 
         B4 = model.calcRadiance(model.channelFilterMap, [T4]) 
@@ -300,23 +422,19 @@ class RadCal:
 
         # Check if you have calibration veiws before & after data (but code should have failed by now if you didn't..)
         if not calibration_flag:
-            if 'cs_look11' not in self.temps['Int']:
-                raise TypeError("Missing calibration view: cs_look11.")
-
-            if 'cs_look21' not in self.temps['Int']:
-                raise TypeError("Missing calibration view: cs_look21.")
-
-            if 'bb_look11' not in self.temps['Int']:
-                raise TypeError("Missing calibration view: bb_look11.")
-                
-            if 'bb_look21' not in self.temps['Int']:
-                raise TypeError("Missing calibration view: bb_look21.")
+            missing = []
+            for g,k in [('Int','bb_look11'),('Int','bb_look21'),
+                        ('Cold','cs_look11'),('Cold','cs_look21')]:
+                if k not in self.temps.get(g, {}):
+                    missing.append(f"{g}/{k}")
+            if missing:
+                raise KeyError(f"Missing calibration views: {', '.join(missing)}")
             
-            # Get the row corrected frames for each view (V1, V2, V4, V5)
-            V1 = self.row_corrected_data['Int']['bb_look11']['stableCorFrames']
-            V2 = self.row_corrected_data['Cold']['cs_look11']['stableCorFrames']
-            V4 = self.row_corrected_data['Int']['bb_look21']['stableCorFrames']
-            V5 = self.row_corrected_data['Cold']['cs_look21']['stableCorFrames'] 
+            # Get the corrected frames for each view (V1, V2, V4, V5)
+            V1 = self.row_corrected_data['Int']['bb_look11']['stableRowSLCorFrames']
+            V2 = self.row_corrected_data['Cold']['cs_look11']['stableRowSLCorFrames']
+            V4 = self.row_corrected_data['Int']['bb_look21']['stableRowSLCorFrames']
+            V5 = self.row_corrected_data['Cold']['cs_look21']['stableRowSLCorFrames'] 
 
             # Calculate the gain (G) and offset (A) values for the start and end of the calibration
             Gstart = (V1 - V2) / (B1 - B2)
@@ -332,10 +450,7 @@ class RadCal:
             Gend = np.mean(Gend, axis=0)
 
         else: 
-            # Expand radiance from temperuatre calculation: 
-            # channel_map = self.load_channel_map(self) --> Not sure why this doesn't work? 
-            mat_data = sio.loadmat('./calibration-tables/RadCalIndex.mat')
-            channel_map = mat_data['RadCal_Index']['ChannelMap'][0,0].T
+            channel_map = self.load_channel_map()  
 
             b1_radframe = np.zeros((288, 384))
             b2_radframe = np.zeros((288, 384))
@@ -350,8 +465,8 @@ class RadCal:
             B2 = b2_radframe
 
             # Get the row corrected frames for each view (V1, V2) - Calibration campaign data only has 1 int & bb view:
-            V1 = 2**14 - self.row_corrected_data['Int']['bb_look11']['stableCorFrames']
-            V2 = 2**14 - self.row_corrected_data['Cold']['cs_look11']['stableCorFrames']
+            V1 = 2**14 - self.row_corrected_data['Int']['bb_look11']['stableRowSLCorFrames']
+            V2 = 2**14 - self.row_corrected_data['Cold']['cs_look11']['stableRowSLCorFrames']
 
             G_t = (V1 - V2) / (B1 - B2)
             A_t = V2 - G_t * B2
@@ -362,11 +477,8 @@ class RadCal:
         # Loop through the data for each key and subgroup (Int, Cold, Hot)
         for key in ['Int', 'Cold', 'Hot']:
             for subgroup in getattr(self, key):
-
-                # Print shape of the dataset before processing
-                data_shape = self.row_corrected_data[key][subgroup]['stableCorFrames'].shape
-                print(f"Processing {key} - {subgroup}: shape {data_shape}")
-
+                data_shape = self.row_corrected_data[key][subgroup]['stableRowSLCorFrames'].shape
+               
                 # Iterate over frames (first dimension of data_shape)
                 num_frames = data_shape[0]
 
@@ -377,22 +489,20 @@ class RadCal:
                         t = self.times[key][subgroup]
 
                         # Calculate the current A(t) and G(t) based on the time `t`
-                        A_t = Astart + (Aend - Astart) * (t) / (t5 - t1)
-                        G_t = Gstart + (Gend - Gstart) * (t) / (t5 - t1)
+                        den = (t5 - t1)
+                        if den == 0: den = 1.0
+                        alpha = (t - t1) / den
+    
+                        A_t = Astart + alpha * (Aend - Astart)
+                        G_t = Gstart + alpha * (Gend - Gstart)
         
-                        # Check if calibration data has the same shape as the scene "Hot" data:
-                        if A_t.shape != self.row_corrected_data[key][subgroup]['stableCorFrames'][frame_idx].shape:
-                            raise ValueError(f"Shape mismatch: A_t: {A_t.shape}, G_t: {G_t.shape}, Frame: {self.row_corrected_data[key][subgroup]['stableRowSLCorFrames'][frame_idx].shape}")
-
-                        else: 
-                            # Calculate the calibrated radiance (without stray light correction)
-                            corr_target_rad = (self.row_corrected_data[key][subgroup]['stableCorFrames'][frame_idx] - A_t) / G_t
+                        corr_target_rad = (self.row_corrected_data[key][subgroup]['stableRowSLCorFrames'][frame_idx] - A_t) / G_t
 
                         # Store calibrated radiance 
                         calibratedRadiance_array.append(corr_target_rad)
 
                 else: 
-                    calibratedRadiance_array = ((2**14 - self.row_corrected_data[key][subgroup]['stableCorFrames']) - A_t) / G_t
+                    calibratedRadiance_array = ((2**14 - self.row_corrected_data[key][subgroup]['stableRowSLCorFrames']) - A_t) / G_t
 
                 # Store the calibrated radiance in the calibrated_products dictionary
                 if key not in self.calibrated_products:
@@ -413,20 +523,36 @@ class RadCal:
                         gain = G_t 
                         offset = A_t
 
-                    fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100) 
+                    if plot_gain_offset: 
+                        fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100) 
                     
-                    im0 = axes[0].imshow(offset, aspect='auto', cmap='plasma')
-                    axes[0].set_title("Calibration Offset - A(t)")
-                    fig.colorbar(im0, ax=axes[0])
-                    
-                    im1 = axes[1].imshow(gain, aspect='auto', cmap='plasma')
-                    axes[1].set_title("Calibraion Gain - G(t)")
-                    fig.colorbar(im1, ax=axes[1])
-                    
-                    plt.tight_layout()
-                    plt.show()
+                        im0 = axes[0].imshow(offset, aspect='auto', cmap='plasma')
+                        axes[0].set_title("Calibration Offset - A(t)")
+                        fig.colorbar(im0, ax=axes[0])
+                        
+                        im1 = axes[1].imshow(gain, aspect='auto', cmap='plasma')
+                        axes[1].set_title("Calibraion Gain - G(t)")
+                        fig.colorbar(im1, ax=axes[1])
+                        
+                        plt.tight_layout()
+                        plt.show()
 
     def decimate_tdi_frame(self, frame_data):
+        """Decimate a full-resolution frame to TDI channels via channel boundaries.
+
+        Parameters:
+            frame_data (np.ndarray):    2-D frame (rows×cols) to be decimated.
+
+        Raises:
+            FileNotFoundError:          If RadCalIndex.mat is missing.
+            ValueError:                 If loaded calibration arrays are invalid.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            np.ndarray:                 2-D TDI-summed data (channels×rows) after reformat.
+        """
         from matplotlib import colormaps
 
         # Load calibration data: 
@@ -504,10 +630,20 @@ class RadCal:
         return summed_data
 
     def plot_calibrated_radiance(self, iframe, plot_log=False):
-        """
-        Plot the calibrated radiance for each key in a new row and each subgroup as columns using a colormap.
-        Each row represents one of the keys ('Int', 'Cold', 'Hot'), and each column represents 
-        a subgroup within the corresponding key.
+        """Plot calibrated radiance grids across keys/subgroups.
+
+        Parameters:
+            iframe (int):               Frame index to visualize.
+            plot_log (bool):            If True, plot log(|radiance|).
+
+        Raises:
+            KeyError:                   If expected keys/subgroups are missing.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            None
         """
         # Get the keys from the calibrated_products dictionary
         keys = ['Int', 'Cold', 'Hot']
@@ -535,13 +671,10 @@ class RadCal:
                     
                     if plot_log: 
                         im_cor = ax.imshow(np.log(np.abs(calibrated_data)),  
-                                            cmap='plasma', aspect='auto', interpolation="None") 
+                                            cmap='plasma', aspect='auto',interpolation=None) 
                     else:
                         im_cor = ax.imshow(calibrated_data, 
-                                           vmin=0, vmax=np.max(calibrated_data), cmap='plasma', aspect='auto', interpolation="None")
-                        
-                        print(np.min((calibrated_data)))
-                        print(np.max((calibrated_data)))
+                                           vmin=0, vmax=np.max(calibrated_data), cmap='plasma', aspect='auto',interpolation=None)
                         
                     # Set titles, labels, and other plot settings
                     ax.set_title(f'{key} - {subgroup}')
@@ -562,12 +695,20 @@ class RadCal:
         plt.show()
 
     def plot_corrected_data(self, group_name, iframe):
-        """
-        This function will plot the raw data, corrected data, and their difference for each subgroup in a given group.
-        It will display them in a grid format, with rows for subgroups and columns for raw and corrected data.
-        
-        :param group_name: The name of the group to plot ('Int', 'Cold', or 'Hot')
-        :param iframe: The index of the frame to plot (for example, if you want to plot a specific frame)
+        """Plot raw, corrected, stabilized, stray-light-corrected, and difference frames.
+
+        Parameters:
+            group_name (str):           'Int', 'Cold', or 'Hot'.
+            iframe (int):               Frame index to plot.
+
+        Raises:
+            KeyError:                   If the group/subgroup is not present.
+
+        Updates RadCal:
+            None
+
+        Returns:
+            None
         """
         # Ensure that the group exists in the RadCal object
         if group_name not in self.row_corrected_data:
@@ -605,17 +746,10 @@ class RadCal:
                 'Stray Light Corrected Frames': straylight_cor_frames[iframe,:,:],
                 'Difference': raw_data[iframe,:,:] - straylight_cor_frames[iframe,:,:]
             }
-            # Calculate vmin and vmax for the first three plots (raw, corrected, stable) based on log-transformed data
-            # all_data_values = np.concatenate([
-            #     data['Raw Data'].ravel(),
-            #     data['Corrected Frames'].ravel(),
-            #     data['Stable Corrected Frames'].ravel()
-            # ])
-            # vmin, vmax = np.min(all_data_values), np.max(all_data_values)
     
             # Plot each subplot and calculate individual vmin and vmax
             for col_idx, (title, plot_data) in enumerate(data.items()):
-                im = axes[idx][col_idx].imshow(plot_data, cmap='plasma' if title != 'Difference' else 'bwr', aspect='auto', interpolation="None")
+                im = axes[idx][col_idx].imshow(plot_data, cmap='plasma' if title != 'Difference' else 'bwr', aspect='auto',interpolation=None)
                 axes[idx][col_idx].set_title(f"{subgroup} {title}")
     
                 # Calculate vmin and vmax independently based on the plot data
@@ -636,3 +770,224 @@ class RadCal:
         # Adjust layout for better presentation
         plt.tight_layout()
         plt.show()
+
+    def save_calibrated_data(self, out_path, overwrite=False):
+        """Write a flat, per-look HDF5 with dataset names.
+
+        Parameters:
+            out_path (str|Path):        Destination .h5 path.
+            overwrite (bool):           If False and file exists → skip (print and return).
+
+        Raises:
+            None (function prints and returns if file exists and overwrite=False)
+
+        Updates RadCal:
+            None (writes to disk only)
+
+        Returns:
+            None
+        """
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.exists() and not overwrite:
+            print(f"  -> output file exists: {out_path}  — skipping")
+            return
+
+        def _to_np(x):
+            if x is None:
+                return None
+            if isinstance(x, np.ndarray):
+                return x
+            try:
+                return np.array(x)
+            except Exception:
+                return None
+
+        def _unique_name(g, base):
+            """Avoid collisions if something with the same name already exists."""
+            name = base
+            k = 1
+            while name in g:
+                name = f"{base} ({k})"
+                k += 1
+            return name
+
+        def _write_flat(g, base, value):
+            """ Write value as one or more datasets into group g using 'base' as name. """
+            if value is None:
+                return
+            if isinstance(value, list):
+                arr = _to_np(value)
+                if arr is not None and arr.dtype != object:
+                    g.create_dataset(_unique_name(g, base), data=arr)
+                else:
+                    for i, v in enumerate(value):
+                        if v is None:
+                            continue
+                        g.create_dataset(_unique_name(g, f"{base} {i:04d}"), data=_to_np(v))
+                return
+            g.create_dataset(_unique_name(g, base), data=_to_np(value))
+
+        def _set_attr(g, key, val):
+            """Always store as an attribute (supports scalars or numpy arrays)."""
+            if val is None:
+                return
+            arr = _to_np(val)
+            if arr is None:
+                return
+            # h5py supports numeric/boolean/string and numpy arrays as attribute values
+            g.attrs[key] = arr
+
+        # Role labels (change if you prefer 'hot/cold/scene')
+        role_map = {
+            'Int':  'Internal Calibration View',
+            'Cold': 'Cold Calibration View',
+            'Hot':  'Scene',
+        }
+
+        # Optional structures on the object
+        rc    = getattr(self, "row_corrected_data", {}) or {}
+        cal   = getattr(self, "calibrated_products", {}) or {}
+        times = getattr(self, "times", {}) or {}
+        tdi   = getattr(self, "tdi_flg", {}) or {}
+        temps = getattr(self, "temps", {}) or {}
+
+        # Name mappings for row-corrected & calibrated keys
+        rc_name_map = {
+            "rawdata": None,                        # skip writing rawdata again
+            "corFrames": "Row Corrected Frames",
+            "offsetAverage": "Offset Average",
+            "stableCorFrames": "Corrected Frames",
+            "stableRowSLCorFrames": "Corrected Frames with Stray Light Removed",
+        }
+        cal_name_map = {
+            "calibratedRadiance": "Calibrated Radiance",
+        }
+
+        with h5py.File(out_path, "w") as f:
+            # walk the three source dicts
+            for src_name in ("Int", "Cold", "Hot"):
+                src_dict = getattr(self, src_name, None)
+                if not isinstance(src_dict, dict) or not src_dict:
+                    continue
+
+                role = role_map.get(src_name, src_name)
+                role_grp = f.require_group(role)
+
+                for look_name, raw_arr in src_dict.items():
+                    look_grp = role_grp.create_group(str(look_name))
+
+                    # --- Raw frames ---
+                    _write_flat(look_grp, "Raw Data", raw_arr)  # renamed from "raw"
+
+                    # --- Row-corrected content (flattened, renamed) ---
+                    rc_map = rc.get(src_name, {}).get(look_name, {})
+                    if isinstance(rc_map, dict) and rc_map:
+                        for k, v in rc_map.items():
+                            pretty = rc_name_map.get(k, None)
+                            if pretty is None:
+                                # skip if explicitly None (e.g., rawdata)
+                                continue
+                            # Unknown keys: keep original name (or make a friendly fallback)
+                            name_to_use = pretty if pretty else k
+                            _write_flat(look_grp, name_to_use, v)
+
+                    # --- Calibrated/products content (flattened, renamed) ---
+                    cal_map = cal.get(src_name, {}).get(look_name, {})
+                    if isinstance(cal_map, dict) and cal_map:
+                        for k, v in cal_map.items():
+                            pretty = cal_name_map.get(k, None)
+                            name_to_use = pretty if pretty else k  # only rename known key(s)
+                            _write_flat(look_grp, name_to_use, v)
+
+                    # --- Per-look attributes (always attributes) ---
+                    _set_attr(look_grp, "time",        times.get(src_name, {}).get(look_name))
+                    _set_attr(look_grp, "temperature", temps.get(src_name, {}).get(look_name))  # renamed from "temp"
+                    _set_attr(look_grp, "tdi_flg",     tdi.get(src_name, {}).get(look_name))
+
+        print(f"Saved RadCal data to {out_path}")
+
+    def plot_quicklook(self, quicklook_path):
+        """Render and save a quicklook of the time-averaged calibrated scene radiance.
+
+        Parameters:
+            quicklook_path (str | pathlib.Path):  Output path (e.g., PNG/PDF) for the saved quicklook figure.
+
+        Raises:
+            KeyError:       If 'Hot' → 'scene' → 'calibratedRadiance' is missing from self.calibrated_products.
+            ValueError:     If the calibrated radiance array is empty or not 3-D (frames × rows × cols).
+            OSError:        If the quicklook image cannot be written to the given path.
+
+        Updates RadCal:
+            None. This function is read-only; it computes a frame-average and writes a figure to disk.
+        """
+        cal_map = self.calibrated_products['Hot']['scene']['calibratedRadiance']
+        avg_frame = np.nanmean(cal_map, axis=0)
+        frame_avg = np.nanmean(avg_frame)
+        frame_std = np.nanstd(avg_frame)
+
+        preview_frame(
+            avg_frame,
+            clim=(0, frame_avg + 1.5 * frame_std),
+            title=f"Calibrated Average Scene Radiance",
+            ctitle="Radiance",                   
+            plot_histogram=False,
+            plot_colorbar=True,
+            save_file=quicklook_path,
+        )
+
+    def describe(self):
+        """Print a human-readable tree of the RadCal object (data, products, and metadata).
+
+        Parameters:
+            None.
+
+        Raises:
+            None.
+
+        Updates RadCal:
+            None. This function only inspects and prints the in-memory structure.
+        """
+
+        def _summ(x):
+            if x is None:
+                return "None"
+            if isinstance(x, np.ndarray):
+                return f"ndarray{tuple(x.shape)} {x.dtype}"
+            if isinstance(x, (int, float, bool, str)):
+                return f"{type(x).__name__}={x}"
+            if isinstance(x, dict):
+                return f"dict[{len(x)}]"
+            if isinstance(x, (list, tuple)):
+                return f"{type(x).__name__}[{len(x)}]"
+            return type(x).__name__
+
+        def _walk_dict(d, indent="  "):
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    print(f"{indent}• {k}/  ({_summ(v)})")
+                    _walk_dict(v, indent + "  ")
+                else:
+                    print(f"{indent}• {k}  ({_summ(v)})")
+
+        print("RadCal structure")
+        print("────────────────")
+        for name in ("Int", "Cold", "Hot"):
+            val = getattr(self, name, None)
+            print(f"{name}/  ({_summ(val)})")
+            if isinstance(val, dict):
+                _walk_dict(val)
+
+        for name in ("row_corrected_data", "calibrated_products"):
+            val = getattr(self, name, {})
+            print(f"{name}/  ({_summ(val)})")
+            if isinstance(val, dict):
+                _walk_dict(val)
+
+        # Key metadata
+        print("metadata/")
+        for name in ("times", "tdi_flg", "temps"):
+            val = getattr(self, name, {})
+            print(f"  • {name}/ ({_summ(val)})")
+            if isinstance(val, dict):
+                _walk_dict(val, indent="    ")

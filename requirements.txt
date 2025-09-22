@@ -1,0 +1,9 @@
+scipy
+matplotlib
+jupyter
+h5py
+pandas
+natsort
+tqdm
+seaborn
+scikit-learn
