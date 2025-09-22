@@ -1,0 +1,80 @@
+# --- Project data directories (ignore everything inside) ---
+ltm-data/
+data/
+datasets/
+outputs/
+results/
+figures/
+
+# --- Common data product formats ---
+*.h5
+*.hdf5
+*.nc
+*.bin
+*.dat
+*.npz
+*.npy
+*.mat
+*.parquet
+*.feather
+*.arrow
+*.orc
+*.csv
+*.tsv
+*.xlsx
+
+# --- Logs & run artifacts ---
+*.log
+logs/
+*.out
+*.err
+
+# --- Generated images/figures/reports ---
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.gif
+*.svg
+*.pdf
+
+# --- Caches, temps, compiled junk ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.dll
+*.tmp
+*.temp
+*.cache
+.cache/
+*.swp
+*.swo
+
+# --- Jupyter cruft ---
+.ipynb_checkpoints/
+
+# --- Environments & secrets ---
+.venv/
+venv/
+.env
+.env.*
+*.secret
+*.key
+
+# --- OS/editor noise ---
+.DS_Store
+Thumbs.db
+
+# --- Keep code & docs (even if parent dirs are ignored) ---
+!.gitignore
+!README.md
+!LICENSE
+!*.py
+!*.ipynb
+!requirements.txt
+!environment.yml
+!pyproject.toml
+!setup.cfg
+
